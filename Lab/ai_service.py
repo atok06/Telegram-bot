@@ -2,8 +2,17 @@ import logging
 
 import httpx
 
-from config import AI_SYSTEM_PROMPT, OPENROUTER_API_KEY, OPENROUTER_API_URL, OPENROUTER_MODEL
+from config import (
+    AI_MEMORY_MESSAGES,
+    AI_SYSTEM_PROMPT,
+    ENABLE_WEB_SEARCH,
+    OPENROUTER_API_KEY,
+    OPENROUTER_API_URL,
+    OPENROUTER_MODEL,
+)
+from request_database import fetch_recent_conversation
 from request_logger import save_log_event
+from web_search import WebSearchResult, format_web_context, search_web, should_use_web_search
 
 
 logger = logging.getLogger(__name__)
@@ -61,23 +70,98 @@ def extract_openrouter_error(response: httpx.Response) -> str:
     return response.text.strip()
 
 
-async def ask_openrouter(prompt: str, user_id: str) -> str:
+def _history_event_to_message(event: dict[str, str]) -> dict[str, str] | None:
+    content = event.get("content", "").strip()
+    if not content:
+        return None
+
+    event_type = event.get("event_type", "")
+    if event_type == "ai_response":
+        return {"role": "assistant", "content": content}
+    if event_type == "audio_transcript":
+        return {"role": "user", "content": f"[voice transcript] {content}"}
+    return {"role": "user", "content": content}
+
+
+def _serialize_web_results(results: list[WebSearchResult]) -> list[dict[str, str]]:
+    return [{"title": item.title, "url": item.url} for item in results]
+
+
+async def build_openrouter_messages(
+    *,
+    prompt: str,
+    user_id: str,
+    chat_id: str = "",
+    current_event_id: int | None = None,
+    force_web_search: bool = False,
+) -> tuple[list[dict[str, str]], list[WebSearchResult], int]:
+    messages: list[dict[str, str]] = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+    history_count = 0
+
+    if AI_MEMORY_MESSAGES > 0:
+        history = fetch_recent_conversation(
+            user_id=user_id,
+            chat_id=chat_id,
+            limit=AI_MEMORY_MESSAGES,
+            before_id=current_event_id,
+        )
+        for event in history:
+            message = _history_event_to_message(event)
+            if message is None:
+                continue
+            messages.append(message)
+            history_count += 1
+
+    web_results: list[WebSearchResult] = []
+    if ENABLE_WEB_SEARCH and should_use_web_search(prompt, force_web_search):
+        try:
+            web_results = await search_web(prompt)
+        except Exception as exc:
+            logger.warning("Web search failed for %r: %s", prompt, exc)
+        else:
+            web_context = format_web_context(web_results)
+            if web_context:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Web search snippets from public internet sources are provided below. "
+                            "Prefer them for current facts, and mention when the available snippets are incomplete.\n\n"
+                            f"{web_context}"
+                        ),
+                    }
+                )
+
+    messages.append({"role": "user", "content": prompt})
+    return messages, web_results, history_count
+
+
+async def ask_openrouter(
+    prompt: str,
+    user_id: str,
+    chat_id: str = "",
+    current_event_id: int | None = None,
+    force_web_search: bool = False,
+) -> tuple[str, list[WebSearchResult], int]:
     """Send one prompt to OpenRouter and return the assistant text."""
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured.")
 
+    messages, web_results, history_count = await build_openrouter_messages(
+        prompt=prompt,
+        user_id=user_id,
+        chat_id=chat_id,
+        current_event_id=current_event_id,
+        force_web_search=force_web_search,
+    )
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "X-OpenRouter-Title": "Telegram AI Bot",
     }
-
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": AI_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "max_completion_tokens": 400,
         "user": user_id,
@@ -97,7 +181,7 @@ async def ask_openrouter(prompt: str, user_id: str) -> str:
     if not answer:
         raise ValueError("OpenRouter returned an empty answer.")
 
-    return answer
+    return answer, web_results, history_count
 
 
 async def send_ai_reply(
@@ -105,6 +189,10 @@ async def send_ai_reply(
     prompt: str,
     user_id: str,
     source_event: str = "ai_request",
+    *,
+    chat_id: str = "",
+    current_event_id: int | None = None,
+    force_web_search: bool = False,
 ) -> str | None:
     """Request an AI answer and send it back to Telegram."""
     if not OPENROUTER_API_KEY:
@@ -123,7 +211,13 @@ async def send_ai_reply(
         return None
 
     try:
-        answer = await ask_openrouter(prompt=prompt, user_id=user_id)
+        answer, web_results, history_count = await ask_openrouter(
+            prompt=prompt,
+            user_id=user_id,
+            chat_id=chat_id,
+            current_event_id=current_event_id,
+            force_web_search=force_web_search,
+        )
     except httpx.HTTPStatusError as exc:
         error_message = extract_openrouter_error(exc.response) or "Unknown OpenRouter error."
         logger.error("OpenRouter HTTP %s error: %s", exc.response.status_code, error_message)
@@ -155,11 +249,19 @@ async def send_ai_reply(
         return None
 
     await message.reply_text(answer)
+    metadata: dict[str, object] = {
+        "source_event": source_event,
+        "prompt": prompt,
+        "history_messages": history_count,
+    }
+    if web_results:
+        metadata["web_results"] = _serialize_web_results(web_results)
+
     save_log_event(
         direction="bot",
         event_type="ai_response",
         content=answer,
         message=message,
-        metadata={"source_event": source_event, "prompt": prompt},
+        metadata=metadata,
     )
     return answer
