@@ -2,12 +2,7 @@
 
 python-telegram-bot[webhooks]==20.3
 httpx==0.24.1
-Pillow
-pytesseract
 gTTS
-markovify
-deep-translator
 python-dotenv
 SpeechRecognition
 imageio-ffmpeg
-easyocr

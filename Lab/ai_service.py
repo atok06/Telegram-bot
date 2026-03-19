@@ -69,7 +69,7 @@ async def ask_openrouter(prompt: str, user_id: str) -> str:
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "X-OpenRouter-Title": "Telegram OCR Bot",
+        "X-OpenRouter-Title": "Telegram AI Bot",
     }
 
     payload = {
@@ -105,7 +105,7 @@ async def send_ai_reply(
     prompt: str,
     user_id: str,
     source_event: str = "ai_request",
-) -> None:
+) -> str | None:
     """Request an AI answer and send it back to Telegram."""
     if not OPENROUTER_API_KEY:
         response_text = (
@@ -120,7 +120,7 @@ async def send_ai_reply(
             message=message,
             metadata={"source_event": source_event},
         )
-        return
+        return None
 
     try:
         answer = await ask_openrouter(prompt=prompt, user_id=user_id)
@@ -140,7 +140,7 @@ async def send_ai_reply(
                 "http_error": error_message,
             },
         )
-        return
+        return None
     except Exception as exc:
         logger.error("OpenRouter request failed: %s", exc)
         response_text = "AI жауап алу кезінде қате шықты."
@@ -152,7 +152,7 @@ async def send_ai_reply(
             message=message,
             metadata={"source_event": source_event, "error": str(exc)},
         )
-        return
+        return None
 
     await message.reply_text(answer)
     save_log_event(
@@ -162,3 +162,4 @@ async def send_ai_reply(
         message=message,
         metadata={"source_event": source_event, "prompt": prompt},
     )
+    return answer

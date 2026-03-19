@@ -43,7 +43,7 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip() or "/telegram"
 WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip() or "0.0.0.0"
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")).strip())
 AI_SYSTEM_PROMPT = (
-    "You are a helpful assistant for a Telegram OCR bot. "
+    "You are a helpful assistant for a Telegram bot. "
     "Reply in the same language as the user. "
     "Keep answers practical and concise."
 )
