@@ -5,7 +5,14 @@ from typing import Any
 
 
 DB_PATH = Path(__file__).resolve().parent / "bot_requests.db"
-AI_CONTEXT_EVENT_TYPES = ("text_message", "ai_command", "web_command", "audio_transcript", "ai_response")
+AI_CONTEXT_EVENT_TYPES = (
+    "text_message",
+    "ai_command",
+    "web_command",
+    "audio_transcript",
+    "ai_response",
+    "image_objects",
+)
 
 
 def init_db(db_path: Path | None = None) -> Path:
@@ -31,6 +38,14 @@ def init_db(db_path: Path | None = None) -> Path:
 
             CREATE INDEX IF NOT EXISTS idx_request_logs_user_id
             ON request_logs(user_id);
+
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                ai_provider TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, chat_id)
+            );
             """
         )
     return db_path
@@ -107,3 +122,50 @@ def fetch_recent_conversation(
         rows = connection.execute(query, params).fetchall()
 
     return [dict(row) for row in reversed(rows)]
+
+
+def set_ai_provider(
+    *,
+    user_id: str,
+    chat_id: str,
+    provider: str,
+    db_path: Path | None = None,
+) -> None:
+    if not user_id or not chat_id:
+        return
+
+    db_path = db_path or DB_PATH
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO user_settings (user_id, chat_id, ai_provider, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, chat_id)
+            DO UPDATE SET ai_provider = excluded.ai_provider, updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, chat_id, provider),
+        )
+        connection.commit()
+
+
+def get_ai_provider(
+    *,
+    user_id: str,
+    chat_id: str,
+    db_path: Path | None = None,
+) -> str:
+    if not user_id or not chat_id:
+        return ""
+
+    db_path = db_path or DB_PATH
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT ai_provider
+            FROM user_settings
+            WHERE user_id = ? AND chat_id = ?
+            """,
+            (user_id, chat_id),
+        ).fetchone()
+
+    return row[0] if row else ""

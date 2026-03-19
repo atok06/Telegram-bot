@@ -33,8 +33,11 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "xiaomi/mimo-v2-omni").strip()
+OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "openai/gpt-5-image-mini").strip()
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DUCKDUCKGO_API_URL = "https://api.duckduckgo.com/"
 WEBHOOK_URL = _normalize_public_url(
@@ -53,6 +56,9 @@ WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")).strip())
 AI_MEMORY_MESSAGES = max(0, int(os.getenv("AI_MEMORY_MESSAGES", "8").strip() or "8"))
 ENABLE_WEB_SEARCH = _get_bool_env("ENABLE_WEB_SEARCH", True)
 WEB_SEARCH_RESULTS_LIMIT = max(1, int(os.getenv("WEB_SEARCH_RESULTS_LIMIT", "5").strip() or "5"))
+DEFAULT_AI_PROVIDER = os.getenv("DEFAULT_AI_PROVIDER", "google").strip().lower() or "google"
+if DEFAULT_AI_PROVIDER not in {"google", "openrouter"}:
+    DEFAULT_AI_PROVIDER = "google"
 AI_SYSTEM_PROMPT = (
     "You are a helpful assistant for a Telegram bot. "
     "Reply in the same language as the user. "
