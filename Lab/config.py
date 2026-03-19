@@ -1,0 +1,55 @@
+import logging
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+
+def _get_first_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _normalize_public_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value.lstrip('/')}"
+    return value
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "xiaomi/mimo-v2-omni").strip()
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+WEBHOOK_URL = _normalize_public_url(
+    _get_first_env(
+        "WEBHOOK_URL",
+        "APP_URL",
+        "RENDER_EXTERNAL_URL",
+        "RAILWAY_STATIC_URL",
+        "RAILWAY_PUBLIC_DOMAIN",
+        "KOYEB_PUBLIC_DOMAIN",
+    )
+)
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip() or "/telegram"
+WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip() or "0.0.0.0"
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")).strip())
+AI_SYSTEM_PROMPT = (
+    "You are a helpful assistant for a Telegram OCR bot. "
+    "Reply in the same language as the user. "
+    "Keep answers practical and concise."
+)
+
+
+def configure_logging() -> None:
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+    for logger_name in ("httpx", "httpcore"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)

@@ -1,0 +1,12 @@
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+Lab/.env
+Lab/bot_requests.db
+Lab/*.jpg
+Lab/*.jpeg
+Lab/*.png
+Lab/*.mp3
+Lab/*.ogg
+Lab/*.wav

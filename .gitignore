@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+Lab/.env
+Lab/bot_requests.db
+Lab/tessdata/
+Lab/*.jpg
+Lab/*.mp3
