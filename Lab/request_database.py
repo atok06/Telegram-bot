@@ -1,23 +1,15 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 
 DB_PATH = Path(__file__).resolve().parent / "bot_requests.db"
-AI_CONTEXT_EVENT_TYPES = (
-    "text_message",
-    "ai_command",
-    "web_command",
-    "audio_transcript",
-    "ai_response",
-    "image_objects",
-)
 
 
-def init_db(db_path: Path | None = None) -> Path:
-    db_path = db_path or DB_PATH
-    with sqlite3.connect(db_path) as connection:
+def init_db(db_path: Optional[Path] = None) -> Path:
+    target_path = db_path or DB_PATH
+    with sqlite3.connect(target_path) as connection:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS request_logs (
@@ -39,16 +31,22 @@ def init_db(db_path: Path | None = None) -> Path:
             CREATE INDEX IF NOT EXISTS idx_request_logs_user_id
             ON request_logs(user_id);
 
-            CREATE TABLE IF NOT EXISTS user_settings (
+            CREATE TABLE IF NOT EXISTS user_profiles (
                 user_id TEXT NOT NULL,
                 chat_id TEXT NOT NULL,
-                ai_provider TEXT NOT NULL,
+                city TEXT NOT NULL DEFAULT '',
+                field TEXT NOT NULL DEFAULT '',
+                experience TEXT NOT NULL DEFAULT '',
+                work_mode TEXT NOT NULL DEFAULT '',
+                salary_text TEXT NOT NULL DEFAULT '',
+                salary_from INTEGER,
+                salary_to INTEGER,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, chat_id)
             );
             """
         )
-    return db_path
+    return target_path
 
 
 def log_event(
@@ -60,12 +58,12 @@ def log_event(
     username: str = "",
     full_name: str = "",
     content: str = "",
-    metadata: dict[str, Any] | None = None,
-    db_path: Path | None = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
 ) -> int:
-    db_path = db_path or DB_PATH
+    target_path = db_path or DB_PATH
     metadata_json = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
-    with sqlite3.connect(db_path) as connection:
+    with sqlite3.connect(target_path) as connection:
         cursor = connection.execute(
             """
             INSERT INTO request_logs (
@@ -79,93 +77,103 @@ def log_event(
         return int(cursor.lastrowid)
 
 
-def fetch_recent_conversation(
-    *,
-    user_id: str = "",
-    chat_id: str = "",
-    limit: int = 8,
-    before_id: int | None = None,
-    db_path: Path | None = None,
-) -> list[dict[str, str]]:
-    db_path = db_path or DB_PATH
-    if not user_id and not chat_id:
-        return []
-
-    filters = ["content <> ''"]
-    params: list[Any] = list(AI_CONTEXT_EVENT_TYPES)
-    filters.append(f"event_type IN ({', '.join('?' for _ in AI_CONTEXT_EVENT_TYPES)})")
-
-    if chat_id:
-        filters.append("chat_id = ?")
-        params.append(chat_id)
-    if user_id:
-        filters.append("user_id = ?")
-        params.append(user_id)
-    if not chat_id and not user_id:
-        return []
-
-    if before_id is not None:
-        filters.append("id < ?")
-        params.append(before_id)
-
-    params.append(max(1, limit))
-    query = f"""
-        SELECT id, created_at, direction, event_type, content
-        FROM request_logs
-        WHERE {' AND '.join(filters)}
-        ORDER BY id DESC
-        LIMIT ?
-    """
-
-    with sqlite3.connect(db_path) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(query, params).fetchall()
-
-    return [dict(row) for row in reversed(rows)]
-
-
-def set_ai_provider(
+def save_user_profile(
     *,
     user_id: str,
     chat_id: str,
-    provider: str,
-    db_path: Path | None = None,
+    city: str,
+    field: str,
+    experience: str,
+    work_mode: str,
+    salary_text: str,
+    salary_from: Optional[int],
+    salary_to: Optional[int],
+    db_path: Optional[Path] = None,
 ) -> None:
     if not user_id or not chat_id:
         return
 
-    db_path = db_path or DB_PATH
-    with sqlite3.connect(db_path) as connection:
+    target_path = db_path or DB_PATH
+    with sqlite3.connect(target_path) as connection:
         connection.execute(
             """
-            INSERT INTO user_settings (user_id, chat_id, ai_provider, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO user_profiles (
+                user_id, chat_id, city, field, experience, work_mode, salary_text, salary_from, salary_to, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(user_id, chat_id)
-            DO UPDATE SET ai_provider = excluded.ai_provider, updated_at = CURRENT_TIMESTAMP
+            DO UPDATE SET
+                city = excluded.city,
+                field = excluded.field,
+                experience = excluded.experience,
+                work_mode = excluded.work_mode,
+                salary_text = excluded.salary_text,
+                salary_from = excluded.salary_from,
+                salary_to = excluded.salary_to,
+                updated_at = CURRENT_TIMESTAMP
             """,
-            (user_id, chat_id, provider),
+            (user_id, chat_id, city, field, experience, work_mode, salary_text, salary_from, salary_to),
         )
         connection.commit()
 
 
-def get_ai_provider(
+def get_user_profile(
     *,
     user_id: str,
     chat_id: str,
-    db_path: Path | None = None,
-) -> str:
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     if not user_id or not chat_id:
-        return ""
+        return {}
 
-    db_path = db_path or DB_PATH
-    with sqlite3.connect(db_path) as connection:
+    target_path = db_path or DB_PATH
+    with sqlite3.connect(target_path) as connection:
+        connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
-            SELECT ai_provider
-            FROM user_settings
+            SELECT city, field, experience, work_mode, salary_text, salary_from, salary_to, updated_at
+            FROM user_profiles
             WHERE user_id = ? AND chat_id = ?
             """,
             (user_id, chat_id),
         ).fetchone()
 
-    return row[0] if row else ""
+    return dict(row) if row else {}
+
+
+def fetch_recent_logs(
+    *,
+    user_id: str = "",
+    chat_id: str = "",
+    limit: int = 20,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    target_path = db_path or DB_PATH
+    filters = []
+    params = []
+
+    if user_id:
+        filters.append("user_id = ?")
+        params.append(user_id)
+    if chat_id:
+        filters.append("chat_id = ?")
+        params.append(chat_id)
+
+    where_clause = ""
+    if filters:
+        where_clause = "WHERE {0}".format(" AND ".join(filters))
+
+    params.append(max(1, limit))
+    query = """
+        SELECT id, created_at, direction, event_type, content, metadata_json
+        FROM request_logs
+        {0}
+        ORDER BY id DESC
+        LIMIT ?
+    """.format(where_clause)
+
+    with sqlite3.connect(target_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(query, params).fetchall()
+
+    return [dict(row) for row in rows]

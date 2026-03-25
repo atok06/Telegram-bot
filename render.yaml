@@ -1,5 +1,5 @@
 services:
-  - name: atok-bot
+  - name: job-assistant-bot
     type: web
     runtime: docker
     plan: free
@@ -8,11 +8,9 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: OPENROUTER_MODEL
-        value: xiaomi/mimo-v2-omni
       - key: WEBHOOK_PATH
         value: /telegram
       - key: WEBHOOK_LISTEN
         value: 0.0.0.0
+      - key: JOB_RESULTS_LIMIT
+        value: 5

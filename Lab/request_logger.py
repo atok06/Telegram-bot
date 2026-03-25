@@ -1,3 +1,5 @@
+from typing import Any, Dict, Optional
+
 from telegram import Update
 
 import request_database
@@ -8,15 +10,20 @@ def save_log_event(
     direction: str,
     event_type: str,
     content: str = "",
-    update: Update | None = None,
+    update: Optional[Update] = None,
     message=None,
-    metadata: dict | None = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
     source_message = message or (update.effective_message if update else None)
     user = source_message.from_user if source_message else (update.effective_user if update else None)
     chat = source_message.chat if source_message else (update.effective_chat if update else None)
     full_name = " ".join(
-        part for part in [getattr(user, "first_name", "") or "", getattr(user, "last_name", "") or ""] if part
+        part
+        for part in (
+            getattr(user, "first_name", "") or "",
+            getattr(user, "last_name", "") or "",
+        )
+        if part
     ).strip()
 
     return request_database.log_event(
@@ -30,7 +37,8 @@ def save_log_event(
         metadata=metadata,
     )
 
-def log_system_event(event_type: str, content: str, metadata: dict | None = None) -> int:
+
+def log_system_event(event_type: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> int:
     return request_database.log_event(
         direction="system",
         event_type=event_type,

@@ -1,96 +1,153 @@
-"""Telegram update handlers and application wiring."""
+"""Telegram handlers for the job assistant bot."""
 
 import logging
-from pathlib import Path
+from typing import Dict, Optional
 
-import audio_recognition
 import request_database
-from ai_service import analyze_image_objects, get_provider_label, normalize_provider, send_ai_reply
-from config import BASE_DIR
-from request_logger import log_system_event, save_log_event
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+from career_advice import build_interview_help, build_quick_job_tip, build_resume_help, build_skills_help
+from job_search import (
+    build_example_vacancies,
+    build_profile_from_record,
+    experience_label,
+    parse_salary_range,
+    profile_summary,
+    search_jobs,
+    search_public_job_links,
+    work_mode_label,
 )
-from tts_service import DEFAULT_TTS_LANGUAGE, generate_speech
+from request_logger import log_system_event, save_log_event
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
 logger = logging.getLogger(__name__)
 
+PROFILE_STEPS = ("city", "field", "experience", "work_mode", "salary")
 
-def remember_last_text(context: ContextTypes.DEFAULT_TYPE, key: str, text: str) -> None:
-    context.user_data[key] = text
-    context.user_data["last_result_text"] = text
+EXPERIENCE_OPTIONS = {
+    "жоқ": "no_experience",
+    "жок": "no_experience",
+    "нет": "no_experience",
+    "no": "no_experience",
+    "1 жыл": "one_year",
+    "1": "one_year",
+    "бір жыл": "one_year",
+    "one year": "one_year",
+    "3+ жыл": "three_plus",
+    "3+": "three_plus",
+    "3 жыл": "three_plus",
+    "3 жылдан жоғары": "three_plus",
+}
 
+WORK_MODE_OPTIONS = {
+    "офлайн": "offline",
+    "offline": "offline",
+    "онлайн": "online",
+    "online": "online",
+    "удаленно": "online",
+    "гибрид": "hybrid",
+    "hybrid": "hybrid",
+}
 
-def resolve_text_for_speech(context: ContextTypes.DEFAULT_TYPE, explicit_text: str) -> str:
-    if explicit_text.strip():
-        return explicit_text.strip()
+MENU_JOB_SEARCH = "Вакансия табу"
+MENU_PROFILE = "Профиль толтыру"
+MENU_RESUME = "Резюме"
+MENU_INTERVIEW = "Сұхбат"
+MENU_SKILLS = "Дағдылар"
+MENU_HELP = "Көмек"
+MENU_WEB = "Web іздеу"
 
-    for key in ("last_result_text", "last_audio_text", "last_image_text"):
-        stored_text = context.user_data.get(key, "")
-        if isinstance(stored_text, str) and stored_text.strip():
-            return stored_text.strip()
-
-    return ""
-
-
-def get_user_speech_language(context: ContextTypes.DEFAULT_TYPE) -> str:
-    saved_language = context.user_data.get("speech_recognition_lang", "")
-    if isinstance(saved_language, str) and saved_language.strip():
-        return saved_language.strip()
-    return audio_recognition.resolve_speech_language("ru")
-
-
-def get_user_ai_provider(context: ContextTypes.DEFAULT_TYPE, update: Update | None = None) -> str:
-    stored_provider = context.user_data.get("ai_provider")
-    if isinstance(stored_provider, str) and stored_provider.strip():
-        return normalize_provider(stored_provider)
-
-    if update and update.effective_user and update.effective_chat:
-        db_provider = request_database.get_ai_provider(
-            user_id=str(update.effective_user.id),
-            chat_id=str(update.effective_chat.id),
-        )
-        if db_provider:
-            normalized = normalize_provider(db_provider)
-            context.user_data["ai_provider"] = normalized
-            return normalized
-
-    return normalize_provider(None)
+SKIP_SALARY_VALUES = {"өткізу", "откізу", "skip", "жоқ", "керек емес"}
 
 
-def set_user_ai_provider(context: ContextTypes.DEFAULT_TYPE, update: Update | None, provider: str) -> str:
-    normalized = normalize_provider(provider)
-    context.user_data["ai_provider"] = normalized
-    if update and update.effective_user and update.effective_chat:
-        request_database.set_ai_provider(
-            user_id=str(update.effective_user.id),
-            chat_id=str(update.effective_chat.id),
-            provider=normalized,
-        )
-    return normalized
-
-
-def build_model_keyboard(current_provider: str) -> InlineKeyboardMarkup:
-    google_label = "Google Gemini"
-    openrouter_label = "OpenRouter"
-    if current_provider == "google":
-        google_label = f"{google_label} [active]"
-    if current_provider == "openrouter":
-        openrouter_label = f"{openrouter_label} [active]"
-
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(google_label, callback_data="model|google"),
-            InlineKeyboardButton(openrouter_label, callback_data="model|openrouter"),
-        ]]
+def _main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [MENU_JOB_SEARCH, MENU_PROFILE],
+            [MENU_RESUME, MENU_INTERVIEW],
+            [MENU_SKILLS, MENU_WEB],
+            [MENU_HELP],
+        ],
+        resize_keyboard=True,
     )
+
+
+def _experience_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["Жоқ", "1 жыл", "3+ жыл"]], resize_keyboard=True, one_time_keyboard=True)
+
+
+def _work_mode_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["Офлайн", "Онлайн", "Гибрид"]], resize_keyboard=True, one_time_keyboard=True)
+
+
+def _salary_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["Өткізу"]], resize_keyboard=True, one_time_keyboard=True)
+
+
+def _get_user_profile(update: Update) -> Dict[str, object]:
+    if not update.effective_user or not update.effective_chat:
+        return {}
+    return request_database.get_user_profile(
+        user_id=str(update.effective_user.id),
+        chat_id=str(update.effective_chat.id),
+    )
+
+
+def _save_user_profile(update: Update, profile: Dict[str, object]) -> None:
+    if not update.effective_user or not update.effective_chat:
+        return
+    request_database.save_user_profile(
+        user_id=str(update.effective_user.id),
+        chat_id=str(update.effective_chat.id),
+        city=str(profile.get("city", "") or ""),
+        field=str(profile.get("field", "") or ""),
+        experience=str(profile.get("experience", "") or ""),
+        work_mode=str(profile.get("work_mode", "") or ""),
+        salary_text=str(profile.get("salary_text", "") or ""),
+        salary_from=profile.get("salary_from"),
+        salary_to=profile.get("salary_to"),
+    )
+
+
+def _is_profile_complete(profile: Dict[str, object]) -> bool:
+    return all(str(profile.get(field_name, "") or "").strip() for field_name in ("city", "field", "experience", "work_mode"))
+
+
+def _begin_profile_flow(context: ContextTypes.DEFAULT_TYPE, existing_profile: Optional[Dict[str, object]] = None) -> None:
+    context.user_data["profile_step"] = PROFILE_STEPS[0]
+    context.user_data["pending_profile"] = dict(existing_profile or {})
+
+
+def _cancel_profile_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("profile_step", None)
+    context.user_data.pop("pending_profile", None)
+
+
+async def _ask_current_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_message:
+        return
+
+    step = context.user_data.get("profile_step", "")
+    if step == "city":
+        await update.effective_message.reply_text("Қай қалада жұмыс іздейсіз?", reply_markup=ReplyKeyboardRemove())
+        return
+    if step == "field":
+        await update.effective_message.reply_text(
+            "Қай салада жұмыс іздейсіз? Мысалы: IT, маркетинг, білім.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    if step == "experience":
+        await update.effective_message.reply_text("Тәжірибеңіз қандай?", reply_markup=_experience_keyboard())
+        return
+    if step == "work_mode":
+        await update.effective_message.reply_text("Қандай формат керек?", reply_markup=_work_mode_keyboard())
+        return
+    if step == "salary":
+        await update.effective_message.reply_text(
+            "Қалаған жалақы диапазонын жазыңыз. Мысалы: 250000-400000. Қаламасаңыз, `Өткізу` деп жазыңыз.",
+            reply_markup=_salary_keyboard(),
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -98,341 +155,361 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     save_log_event(direction="user", event_type="command_start", content="/start", update=update)
-    welcome_text = (
-        "Сәлем. Бұл бот OCR қолданбайды.\n\n"
-        "1) Жай мәтін жіберсеңіз, бот AI жауап қайтарады\n"
-        "2) /model командасымен Google Gemini не OpenRouter таңдай аласыз\n"
-        "3) Сурет жіберсеңіз, бот ондағы негізгі объектілерді таниды\n"
-        "4) /web командасы интернеттен контекст алып жауап береді\n"
-        "5) Voice немесе audio жіберсеңіз, бот оны мәтінге айналдырады және есте сақтайды\n"
-        "6) /speak командасы мәтінді дыбыстап береді"
-    )
-    await update.message.reply_text(welcome_text)
-    save_log_event(direction="bot", event_type="welcome_message", content=welcome_text, update=update)
-    provider = get_user_ai_provider(context, update)
-    await update.message.reply_text(
-        f"Қазіргі модель: {get_provider_label(provider)}",
-        reply_markup=build_model_keyboard(provider),
-    )
-
-
-async def get_image_file(message: Message) -> tuple[object | None, str]:
-    if message.photo:
-        return await message.photo[-1].get_file(), ".jpg"
-
-    if message.document and (message.document.mime_type or "").startswith("image/"):
-        suffix = Path(message.document.file_name or "").suffix or ".jpg"
-        return await message.document.get_file(), suffix
-
-    return None, ".jpg"
-
-
-async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
+    existing_profile = _get_user_profile(update)
+    if _is_profile_complete(existing_profile):
+        profile = build_profile_from_record(existing_profile)
+        text = (
+            "Мен жұмыс іздеуге көмектесемін.\n\n"
+            "Сақталған профиліңіз:\n{0}\n\n"
+            "Дайын командалар:\n"
+            "/jobs - сай вакансиялар\n"
+            "/search - web пен соц-желі сілтемелері\n"
+            "/resume - резюме көмегі\n"
+            "/interview - сұхбат сұрақтары\n"
+            "/skills - дамыту керек дағдылар\n"
+            "/profile - профильді жаңарту"
+        ).format(profile_summary(profile))
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="welcome_existing_profile", content=text, update=update)
         return
 
-    telegram_file, suffix = await get_image_file(update.message)
-    if not telegram_file:
-        return
-
-    user_id = str(update.effective_user.id)
-    image_path = BASE_DIR / f"{user_id}_image{suffix}"
-    provider = get_user_ai_provider(context, update)
-    caption_prompt = (update.message.caption or "").strip()
-    save_log_event(
-        direction="user",
-        event_type="image_upload",
-        content="[image]",
-        update=update,
-        metadata={"suffix": suffix, "caption": caption_prompt},
-    )
-
-    try:
-        await telegram_file.download_to_drive(str(image_path))
-        if not image_path.exists():
-            raise RuntimeError("Image file was not downloaded.")
-
-        detected_text = await analyze_image_objects(
-            str(image_path),
-            user_id,
-            provider=provider,
-            prompt=caption_prompt,
-        )
-        remember_last_text(context, "last_image_text", detected_text)
-        await update.message.reply_text(detected_text)
-        save_log_event(
-            direction="bot",
-            event_type="image_objects",
-            content=detected_text,
-            update=update,
-            metadata={"caption": caption_prompt, "provider": provider},
-        )
-    except Exception as exc:
-        logger.error("Image object detection failed: %s", exc)
-        response_text = str(exc) if isinstance(exc, RuntimeError) else "Суреттегі объектілерді тану кезінде қате шықты."
-        await update.message.reply_text(response_text)
-        save_log_event(
-            direction="bot",
-            event_type="image_error",
-            content=response_text,
-            update=update,
-            metadata={"error": str(exc), "provider": provider},
-        )
-    finally:
-        if image_path.exists():
-            image_path.unlink()
+    _begin_profile_flow(context, existing_profile)
+    welcome_text = "Мен сізге өзіңізге сай жұмысты тез табуға көмектесемін.\nАлдымен 5 қысқа сұрақ қоямын."
+    await update.message.reply_text(welcome_text, reply_markup=ReplyKeyboardRemove())
+    save_log_event(direction="bot", event_type="welcome_new_profile", content=welcome_text, update=update)
+    await _ask_current_question(update, context)
 
 
-async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-
-    explicit_text = " ".join(context.args).strip()
-    text_to_speak = resolve_text_for_speech(context, explicit_text)
-    if not text_to_speak:
-        response_text = "Дыбыстауға мәтін жоқ. Әуелі мәтін, сурет не audio жіберіңіз, не `/speak мәтін` деп жазыңыз."
-        await update.message.reply_text(response_text)
-        save_log_event(direction="bot", event_type="speak_error", content=response_text, update=update)
-        return
-
-    user_id = str(update.effective_user.id)
-    audio_path = BASE_DIR / f"{user_id}_speech.mp3"
-    save_log_event(
-        direction="user",
-        event_type="speak_command",
-        content=explicit_text or "[last_result_text]",
-        update=update,
-        metadata={"tts_lang": DEFAULT_TTS_LANGUAGE},
-    )
-
-    try:
-        generate_speech(text_to_speak, str(audio_path), language=DEFAULT_TTS_LANGUAGE)
-        if not audio_path.exists():
-            raise RuntimeError("Speech file was not created.")
-
-        with audio_path.open("rb") as audio_stream:
-            await update.message.reply_audio(audio=audio_stream)
-
-        save_log_event(
-            direction="bot",
-            event_type="speech_reply",
-            content="[audio]",
-            update=update,
-            metadata={"tts_lang": DEFAULT_TTS_LANGUAGE},
-        )
-    except Exception as exc:
-        logger.error("Speech generation error: %s", exc)
-        response_text = "Дыбыстық жауап жасау кезінде қате шықты."
-        await update.message.reply_text(response_text)
-        save_log_event(
-            direction="bot",
-            event_type="speak_error",
-            content=response_text,
-            update=update,
-            metadata={"error": str(exc), "tts_lang": DEFAULT_TTS_LANGUAGE},
-        )
-    finally:
-        if audio_path.exists():
-            audio_path.unlink()
-
-
-async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-
-    prompt = " ".join(context.args).strip()
-    if not prompt:
-        response_text = "Қолдану үлгісі: /ai Қазақстан туралы қысқаша айт"
-        await update.message.reply_text(response_text)
-        save_log_event(direction="bot", event_type="ai_prompt_help", content=response_text, update=update)
-        return
-
-    provider = get_user_ai_provider(context, update)
-    event_id = save_log_event(direction="user", event_type="ai_command", content=prompt, update=update)
-    answer = await send_ai_reply(
-        update.message,
-        prompt,
-        str(update.effective_user.id),
-        source_event="ai_command",
-        provider=provider,
-        chat_id=str(update.effective_chat.id),
-        current_event_id=event_id,
-    )
-    if answer:
-        remember_last_text(context, "last_result_text", answer)
-
-
-async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-
-    prompt = " ".join(context.args).strip()
-    if not prompt:
-        response_text = "Қолдану үлгісі: /web бүгінгі жаңалықтарды қысқаша айт"
-        await update.message.reply_text(response_text)
-        save_log_event(direction="bot", event_type="web_prompt_help", content=response_text, update=update)
-        return
-
-    provider = get_user_ai_provider(context, update)
-    event_id = save_log_event(direction="user", event_type="web_command", content=prompt, update=update)
-    answer = await send_ai_reply(
-        update.message,
-        prompt,
-        str(update.effective_user.id),
-        source_event="web_command",
-        provider=provider,
-        chat_id=str(update.effective_chat.id),
-        current_event_id=event_id,
-        force_web_search=True,
-    )
-    if answer:
-        remember_last_text(context, "last_result_text", answer)
-
-
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user or not update.message.text:
-        return
-
-    prompt = update.message.text.strip()
-    if not prompt:
-        return
-
-    provider = get_user_ai_provider(context, update)
-    event_id = save_log_event(direction="user", event_type="text_message", content=prompt, update=update)
-    answer = await send_ai_reply(
-        update.message,
-        prompt,
-        str(update.effective_user.id),
-        source_event="text_message",
-        provider=provider,
-        chat_id=str(update.effective_chat.id),
-        current_event_id=event_id,
-    )
-    if answer:
-        remember_last_text(context, "last_result_text", answer)
-
-
-async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-
-    telegram_audio = update.message.voice or update.message.audio
-    if not telegram_audio:
-        return
-
-    user_id = str(update.effective_user.id)
-    suffix = ".ogg"
-    if update.message.audio and update.message.audio.file_name:
-        detected_suffix = Path(update.message.audio.file_name).suffix
-        if detected_suffix:
-            suffix = detected_suffix
-
-    source_path = BASE_DIR / f"{user_id}_audio{suffix}"
-    language = get_user_speech_language(context)
-    save_log_event(
-        direction="user",
-        event_type="audio_upload",
-        content="[audio]",
-        update=update,
-        metadata={"suffix": suffix, "language": language},
-    )
-
-    try:
-        telegram_file = await telegram_audio.get_file()
-        await telegram_file.download_to_drive(str(source_path))
-
-        transcript = audio_recognition.transcribe_audio_file(str(source_path), language=language)
-        remember_last_text(context, "last_audio_text", transcript)
-        save_log_event(
-            direction="user",
-            event_type="audio_transcript",
-            content=transcript,
-            update=update,
-            metadata={"language": language},
-        )
-
-        transcript_message = f"Танылған мәтін:\n\n{transcript}"
-        await update.message.reply_text(transcript_message)
-        save_log_event(direction="bot", event_type="audio_transcript_reply", content=transcript_message, update=update)
-    except audio_recognition.AudioRecognitionError as exc:
-        logger.error("Audio recognition error: %s", exc)
-        response_text = str(exc)
-        await update.message.reply_text(response_text)
-        save_log_event(direction="bot", event_type="audio_error", content=response_text, update=update)
-    except Exception as exc:
-        logger.error("Audio processing error: %s", exc)
-        response_text = "Аудионы өңдеу кезінде қате шықты."
-        await update.message.reply_text(response_text)
-        save_log_event(
-            direction="bot",
-            event_type="audio_error",
-            content=response_text,
-            update=update,
-            metadata={"error": str(exc)},
-        )
-    finally:
-        if source_path.exists():
-            source_path.unlink()
-
-
-async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    if context.args:
-        raw_provider = context.args[0].strip().lower()
-        if raw_provider not in {"google", "openrouter"}:
-            response_text = "Қолдану үлгісі: /model google немесе /model openrouter"
-            await update.message.reply_text(response_text, reply_markup=build_model_keyboard(get_user_ai_provider(context, update)))
-            save_log_event(direction="bot", event_type="model_help", content=response_text, update=update)
-            return
+    save_log_event(direction="user", event_type="command_help", content="/help", update=update)
+    help_text = (
+        "Командалар:\n"
+        "/profile - профиль толтыру не жаңарту\n"
+        "/jobs - профиліңізге сай вакансиялар\n"
+        "/search <сұрау> - web және public соц-желі сілтемелері\n"
+        "/resume - резюме көмегі\n"
+        "/interview - сұхбат сұрақтары\n"
+        "/skills - дамыту керек дағдылар\n"
+        "/cancel - анкетаны тоқтату"
+    )
+    await update.message.reply_text(help_text, reply_markup=_main_menu_keyboard())
+    save_log_event(direction="bot", event_type="help_message", content=help_text, update=update)
 
-        provider = normalize_provider(raw_provider)
-        set_user_ai_provider(context, update, provider)
-        response_text = f"Модель ауыстырылды: {get_provider_label(provider)}"
-        await update.message.reply_text(response_text, reply_markup=build_model_keyboard(provider))
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    save_log_event(direction="user", event_type="command_profile", content="/profile", update=update)
+    _begin_profile_flow(context, _get_user_profile(update))
+    await update.message.reply_text("Профильді жаңартамыз. Жауаптарыңыз қысқа болса жеткілікті.")
+    await _ask_current_question(update, context)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    _cancel_profile_flow(context)
+    text = "Анкета тоқтатылды. Қайта бастау үшін /profile деп жазыңыз."
+    await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+    save_log_event(direction="bot", event_type="profile_cancelled", content=text, update=update)
+
+
+async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    query = " ".join(context.args).strip()
+    save_log_event(direction="user", event_type="command_jobs", content=query or "/jobs", update=update)
+    await _run_job_search(update, query=query)
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    query = " ".join(context.args).strip()
+    save_log_event(direction="user", event_type="command_search", content=query or "/search", update=update)
+    profile_record = _get_user_profile(update)
+    if not _is_profile_complete(profile_record) and not query:
+        text = "Алдымен /profile арқылы қысқа профиль толтырыңыз немесе /search Python developer Almaty сияқты жазыңыз."
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="search_missing_profile", content=text, update=update)
+        return
+
+    profile = build_profile_from_record(profile_record, query=query)
+    await update.message.reply_text("Public web көздерден іздеп жатырмын...", reply_markup=_main_menu_keyboard())
+    try:
+        vacancies = await search_public_job_links(profile)
+    except Exception as exc:
+        logger.exception("Public search failed: %s", exc)
+        text = "Web іздеу кезінде қате шықты. /jobs командасымен ресми вакансияларды қарап көріңіз."
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="search_error", content=text, update=update, metadata={"error": str(exc)})
+        return
+
+    if not vacancies:
+        text = "Ашық индекстелген web/соц сілтемелер табылмады. /jobs командасын қолданып көріңіз."
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="search_no_results", content=text, update=update)
+        return
+
+    response = _format_vacancies_message("Public web және соц-желі нәтижелері:", vacancies, False)
+    await update.message.reply_text(response, reply_markup=_main_menu_keyboard(), disable_web_page_preview=True)
+    save_log_event(
+        direction="bot",
+        event_type="search_results",
+        content=response,
+        update=update,
+        metadata={"results": len(vacancies), "query": profile.effective_query},
+    )
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    save_log_event(direction="user", event_type="command_resume", content="/resume", update=update)
+    profile = _get_user_profile(update)
+    if not _is_profile_complete(profile):
+        text = "Резюме кеңесі дәл шығуы үшін алдымен /profile толтырыңыз."
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="resume_missing_profile", content=text, update=update)
+        return
+
+    response = build_resume_help(profile)
+    await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
+    save_log_event(direction="bot", event_type="resume_help", content=response, update=update)
+
+
+async def interview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    save_log_event(direction="user", event_type="command_interview", content="/interview", update=update)
+    profile = _get_user_profile(update)
+    if not _is_profile_complete(profile):
+        text = "Сұхбат сұрақтары нақты болу үшін алдымен /profile толтырыңыз."
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="interview_missing_profile", content=text, update=update)
+        return
+
+    response = build_interview_help(profile)
+    await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
+    save_log_event(direction="bot", event_type="interview_help", content=response, update=update)
+
+
+async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    save_log_event(direction="user", event_type="command_skills", content="/skills", update=update)
+    profile = _get_user_profile(update)
+    if not _is_profile_complete(profile):
+        text = "Дағды кеңесі нақты болу үшін алдымен /profile толтырыңыз."
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="skills_missing_profile", content=text, update=update)
+        return
+
+    response = build_skills_help(profile)
+    await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
+    save_log_event(direction="bot", event_type="skills_help", content=response, update=update)
+
+
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    save_log_event(direction="user", event_type="text_message", content=text, update=update)
+
+    if context.user_data.get("profile_step"):
+        await _handle_profile_answer(update, context, text)
+        return
+
+    if text == MENU_JOB_SEARCH:
+        await _run_job_search(update)
+        return
+    if text == MENU_PROFILE:
+        await profile_command(update, context)
+        return
+    if text == MENU_RESUME:
+        await resume_command(update, context)
+        return
+    if text == MENU_INTERVIEW:
+        await interview_command(update, context)
+        return
+    if text == MENU_SKILLS:
+        await skills_command(update, context)
+        return
+    if text == MENU_HELP:
+        await help_command(update, context)
+        return
+    if text == MENU_WEB:
+        await search_command(update, context)
+        return
+
+    lowered = text.lower()
+    if any(word in lowered for word in ("резюме", "resume", "cv")):
+        await resume_command(update, context)
+        return
+    if any(word in lowered for word in ("сұхбат", "сухбат", "interview")):
+        await interview_command(update, context)
+        return
+    if any(word in lowered for word in ("дағды", "дагды", "skills", "skill")):
+        await skills_command(update, context)
+        return
+    if any(word in lowered for word in ("жұмыс", "жумыс", "вакансия", "vacancy", "job")):
+        await _run_job_search(update, query=text)
+        return
+
+    response = (
+        "Мен мына нәрселерге көмектесемін: вакансия, резюме, сұхбат, дағды.\n"
+        "Жылдам бастау үшін /profile немесе /jobs қолданыңыз."
+    )
+    await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
+    save_log_event(direction="bot", event_type="fallback_help", content=response, update=update)
+
+
+async def _handle_profile_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, answer: str) -> None:
+    if not update.message:
+        return
+
+    pending_profile = dict(context.user_data.get("pending_profile", {}))
+    step = str(context.user_data.get("profile_step", "") or "")
+
+    if step == "city":
+        pending_profile["city"] = answer
+        next_step = "field"
+    elif step == "field":
+        pending_profile["field"] = answer
+        next_step = "experience"
+    elif step == "experience":
+        normalized = EXPERIENCE_OPTIONS.get(answer.strip().lower())
+        if not normalized:
+            await update.message.reply_text("Таңдаңыз: Жоқ, 1 жыл, 3+ жыл.", reply_markup=_experience_keyboard())
+            return
+        pending_profile["experience"] = normalized
+        next_step = "work_mode"
+    elif step == "work_mode":
+        normalized = WORK_MODE_OPTIONS.get(answer.strip().lower())
+        if not normalized:
+            await update.message.reply_text("Таңдаңыз: Офлайн, Онлайн, Гибрид.", reply_markup=_work_mode_keyboard())
+            return
+        pending_profile["work_mode"] = normalized
+        next_step = "salary"
+    elif step == "salary":
+        normalized_answer = answer.strip().lower()
+        if normalized_answer in SKIP_SALARY_VALUES:
+            salary_text, salary_from, salary_to = "", None, None
+        else:
+            salary_text, salary_from, salary_to = parse_salary_range(answer)
+        pending_profile["salary_text"] = salary_text
+        pending_profile["salary_from"] = salary_from
+        pending_profile["salary_to"] = salary_to
+        next_step = ""
+    else:
+        _cancel_profile_flow(context)
+        return
+
+    context.user_data["pending_profile"] = pending_profile
+    context.user_data["profile_step"] = next_step
+    if next_step:
+        await _ask_current_question(update, context)
+        return
+
+    _save_user_profile(update, pending_profile)
+    _cancel_profile_flow(context)
+
+    summary = (
+        "Профиль сақталды:\n"
+        "Қала: {0}\n"
+        "Сала: {1}\n"
+        "Тәжірибе: {2}\n"
+        "Формат: {3}\n"
+        "Жалақы: {4}"
+    ).format(
+        pending_profile.get("city", "Көрсетілмеген"),
+        pending_profile.get("field", "Көрсетілмеген"),
+        experience_label(str(pending_profile.get("experience", "") or "")),
+        work_mode_label(str(pending_profile.get("work_mode", "") or "")),
+        pending_profile.get("salary_text") or "Көрсетілмеген",
+    )
+    await update.message.reply_text(summary, reply_markup=_main_menu_keyboard())
+    save_log_event(direction="bot", event_type="profile_saved", content=summary, update=update)
+    await _run_job_search(update)
+
+
+async def _run_job_search(update: Update, query: str = "") -> None:
+    if not update.effective_message:
+        return
+
+    profile_record = _get_user_profile(update)
+    if not _is_profile_complete(profile_record):
+        text = "Алдымен 5 қысқа сұраққа жауап берейік. /profile деп жазыңыз."
+        await update.effective_message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="jobs_missing_profile", content=text, update=update)
+        return
+
+    profile = build_profile_from_record(profile_record, query=query)
+    await update.effective_message.reply_text("Сізге сай вакансияларды іздеп жатырмын...", reply_markup=_main_menu_keyboard())
+
+    try:
+        vacancies = await search_jobs(profile)
+    except Exception as exc:
+        logger.exception("Job search failed: %s", exc)
+        text = "Вакансия іздеу кезінде қате шықты. Кейінірек қайталап көріңіз."
+        await update.effective_message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="jobs_error", content=text, update=update, metadata={"error": str(exc)})
+        return
+
+    if vacancies:
+        response = _format_vacancies_message("Сізге сай 3-5 вакансия:", vacancies, True, build_quick_job_tip(profile_record))
+        await update.effective_message.reply_text(response, reply_markup=_main_menu_keyboard(), disable_web_page_preview=True)
         save_log_event(
             direction="bot",
-            event_type="model_changed",
-            content=response_text,
+            event_type="job_results",
+            content=response,
             update=update,
-            metadata={"provider": provider},
+            metadata={"results": len(vacancies), "query": profile.effective_query},
         )
         return
 
-    provider = get_user_ai_provider(context, update)
-    response_text = f"Қазіргі модель: {get_provider_label(provider)}"
-    await update.message.reply_text(response_text, reply_markup=build_model_keyboard(provider))
-    save_log_event(
-        direction="bot",
-        event_type="model_menu",
-        content=response_text,
-        update=update,
-        metadata={"provider": provider},
+    examples = build_example_vacancies(profile)
+    response = _format_vacancies_message(
+        "Нақты live вакансия табылмады. Төменде ұқсас мысалдар:",
+        examples,
+        True,
+        build_quick_job_tip(profile_record),
     )
+    await update.effective_message.reply_text(response, reply_markup=_main_menu_keyboard(), disable_web_page_preview=True)
+    save_log_event(direction="bot", event_type="job_examples", content=response, update=update, metadata={"query": profile.effective_query})
 
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-    data = query.data or ""
-    if not data.startswith("model|"):
-        return
-
-    provider = normalize_provider(data.split("|", 1)[1])
-    set_user_ai_provider(context, update, provider)
-    response_text = f"Модель ауыстырылды: {get_provider_label(provider)}"
-    await query.edit_message_text(response_text, reply_markup=build_model_keyboard(provider))
-    save_log_event(
-        direction="bot",
-        event_type="model_changed",
-        content=response_text,
-        update=update,
-        metadata={"provider": provider},
-    )
+def _format_vacancies_message(heading: str, vacancies, include_tip: bool, tip: str = "") -> str:
+    lines = [heading]
+    for index, vacancy in enumerate(vacancies, start=1):
+        lines.append("")
+        lines.append("{0}. {1}".format(index, vacancy.title))
+        lines.append("Компания: {0}".format(vacancy.company))
+        lines.append("Қысқаша: {0}".format(vacancy.summary))
+        lines.append("Жалақы: {0}".format(vacancy.salary))
+        if vacancy.apply_url:
+            lines.append("Өтініш: {0} {1}".format(vacancy.apply_text, vacancy.apply_url))
+        else:
+            lines.append("Өтініш: {0}".format(vacancy.apply_text))
+        lines.append("Дереккөз: {0}".format(vacancy.source))
+    if include_tip and tip:
+        lines.append("")
+        lines.append(tip)
+    return "\n".join(lines)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -446,12 +523,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ai", ai_command))
-    app.add_handler(CommandHandler("model", model_command))
-    app.add_handler(CommandHandler("web", web_command))
-    app.add_handler(CommandHandler("speak", speak_command))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_message))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio_message))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("profile", profile_command))
+    app.add_handler(CommandHandler("jobs", jobs_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("resume", resume_command))
+    app.add_handler(CommandHandler("interview", interview_command))
+    app.add_handler(CommandHandler("skills", skills_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-    app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)

@@ -9,66 +9,53 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 
-def _get_first_env(*names: str) -> str:
-    for name in names:
-        value = os.getenv(name, "").strip()
-        if value:
-            return value
+def _get_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
+def _detect_webhook_url() -> str:
+    for env_name in ("WEBHOOK_URL", "RENDER_EXTERNAL_URL", "RAILWAY_PUBLIC_DOMAIN"):
+        value = os.getenv(env_name, "").strip()
+        if not value:
+            continue
+        if value.startswith("http://") or value.startswith("https://"):
+            return value.rstrip("/")
+        return "https://{0}".format(value.rstrip("/"))
     return ""
 
 
-def _normalize_public_url(value: str) -> str:
-    value = value.strip().rstrip("/")
-    if not value:
-        return ""
-    if "://" not in value:
-        value = f"https://{value.lstrip('/')}"
-    return value
-
-
-def _get_bool_env(name: str, default: bool) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    if not value:
-        return default
-    return value not in {"0", "false", "no", "off"}
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "xiaomi/mimo-v2-omni").strip()
-OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "openai/gpt-5-image-mini").strip()
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DUCKDUCKGO_API_URL = "https://api.duckduckgo.com/"
-WEBHOOK_URL = _normalize_public_url(
-    _get_first_env(
-        "WEBHOOK_URL",
-        "APP_URL",
-        "RENDER_EXTERNAL_URL",
-        "RAILWAY_STATIC_URL",
-        "RAILWAY_PUBLIC_DOMAIN",
-        "KOYEB_PUBLIC_DOMAIN",
-    )
-)
+
+WEBHOOK_URL = _detect_webhook_url()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip() or "/telegram"
 WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip() or "0.0.0.0"
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")).strip())
-AI_MEMORY_MESSAGES = max(0, int(os.getenv("AI_MEMORY_MESSAGES", "8").strip() or "8"))
-ENABLE_WEB_SEARCH = _get_bool_env("ENABLE_WEB_SEARCH", True)
-WEB_SEARCH_RESULTS_LIMIT = max(1, int(os.getenv("WEB_SEARCH_RESULTS_LIMIT", "5").strip() or "5"))
-DEFAULT_AI_PROVIDER = os.getenv("DEFAULT_AI_PROVIDER", "google").strip().lower() or "google"
-if DEFAULT_AI_PROVIDER not in {"google", "openrouter"}:
-    DEFAULT_AI_PROVIDER = "google"
-AI_SYSTEM_PROMPT = (
-    "You are a helpful assistant for a Telegram bot. "
-    "Reply in the same language as the user. "
-    "Use prior conversation context when it is relevant. "
-    "If web search snippets are provided, use them for time-sensitive facts and mention uncertainty when needed. "
-    "Keep answers practical and concise."
-)
+WEBHOOK_PORT = _get_int("PORT", _get_int("WEBHOOK_PORT", 8080))
+
+HH_API_BASE_URL = os.getenv("HH_API_BASE_URL", "https://api.hh.ru").strip() or "https://api.hh.ru"
+BING_SEARCH_URL = os.getenv("BING_SEARCH_URL", "https://www.bing.com/search").strip() or "https://www.bing.com/search"
+DEFAULT_COUNTRY_AREA_ID = os.getenv("DEFAULT_COUNTRY_AREA_ID", "40").strip() or "40"
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20").strip() or "20")
+
+JOB_RESULTS_LIMIT = max(3, min(_get_int("JOB_RESULTS_LIMIT", 5), 5))
+PUBLIC_SEARCH_RESULTS_LIMIT = max(1, min(_get_int("PUBLIC_SEARCH_RESULTS_LIMIT", 3), 5))
+ENABLE_PUBLIC_WEB_SEARCH = _get_bool("ENABLE_PUBLIC_WEB_SEARCH", True)
 
 
 def configure_logging() -> None:
-    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-    for logger_name in ("httpx", "httpcore"):
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )

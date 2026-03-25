@@ -1,8 +1,3 @@
-# requirements.txt
-
 python-telegram-bot[webhooks]==20.3
 httpx==0.24.1
-gTTS
-python-dotenv
-SpeechRecognition
-imageio-ffmpeg
+python-dotenv==1.0.1
