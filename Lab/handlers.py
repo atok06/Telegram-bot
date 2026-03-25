@@ -7,10 +7,11 @@ import request_database
 from ai_service import ask_career_ai, any_ai_available
 from career_advice import build_interview_help, build_quick_job_tip, build_resume_help, build_skills_help
 from job_search import (
-    build_example_vacancies,
+    UnsafeJobDataError,
     build_profile_from_record,
     experience_label,
     parse_salary_range,
+    partition_vacancies,
     profile_summary,
     search_jobs,
     search_public_job_links,
@@ -60,6 +61,15 @@ MENU_AI = "AI кеңес"
 MENU_HELP = "Көмек"
 
 SKIP_SALARY_VALUES = {"өткізу", "откізу", "skip", "жоқ", "керек емес"}
+
+UNSAFE_VACANCY_TEXT = (
+    "Қате: сенімсіз немесе өтірік вакансия ақпараты анықталды. "
+    "Бот ондай хабарландыруды көрсетпейді."
+)
+
+NO_RELIABLE_VACANCY_TEXT = (
+    "Қазір сенімді вакансия табылмады. Сұрауды нақтылап көріңіз немесе тек ресми сайттарды қолданыңыз."
+)
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -192,7 +202,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Командалар:\n"
         "/profile - профиль толтыру не жаңарту\n"
         "/jobs - профиліңізге сай вакансиялар\n"
-        "/search <сұрау> - web және public соц-желі сілтемелері\n"
+        "/search <сұрау> - web және public сілтемелер\n"
         "/resume - резюме көмегі\n"
         "/interview - сұхбат сұрақтары\n"
         "/skills - дамыту керек дағдылар\n"
@@ -264,7 +274,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     profile = build_profile_from_record(profile_record, query=query)
     await update.message.reply_text("Public web көздерден іздеп жатырмын...", reply_markup=_main_menu_keyboard())
     try:
-        vacancies = await search_public_job_links(profile)
+        raw_results = await search_public_job_links(profile)
     except Exception as exc:
         logger.exception("Public search failed: %s", exc)
         text = "Web іздеу кезінде қате шықты. /jobs командасымен ресми вакансияларды қарап көріңіз."
@@ -272,13 +282,22 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         save_log_event(direction="bot", event_type="search_error", content=text, update=update, metadata={"error": str(exc)})
         return
 
-    if not vacancies:
-        text = "Ашық индекстелген web/соц сілтемелер табылмады. /jobs командасын қолданып көріңіз."
-        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
-        save_log_event(direction="bot", event_type="search_no_results", content=text, update=update)
+    direct_results = [item for item in raw_results if item.is_direct_listing]
+    portal_results = [item for item in raw_results if not item.is_direct_listing]
+    safe_direct, unsafe_direct = partition_vacancies(direct_results)
+    vacancies = safe_direct + portal_results
+
+    if not vacancies and unsafe_direct:
+        await update.message.reply_text(UNSAFE_VACANCY_TEXT, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="search_unsafe_results", content=UNSAFE_VACANCY_TEXT, update=update)
         return
 
-    response = _format_vacancies_message("Public web және соц-желі нәтижелері:", vacancies, False)
+    if not vacancies:
+        await update.message.reply_text(NO_RELIABLE_VACANCY_TEXT, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="search_no_results", content=NO_RELIABLE_VACANCY_TEXT, update=update)
+        return
+
+    response = _format_vacancies_message("Public web және ресми сілтемелер:", vacancies, False)
     await update.message.reply_text(response, reply_markup=_main_menu_keyboard(), disable_web_page_preview=True)
     save_log_event(
         direction="bot",
@@ -502,6 +521,10 @@ async def _run_job_search(update: Update, query: str = "") -> None:
 
     try:
         vacancies = await search_jobs(profile)
+    except UnsafeJobDataError:
+        await update.effective_message.reply_text(UNSAFE_VACANCY_TEXT, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="jobs_unsafe_results", content=UNSAFE_VACANCY_TEXT, update=update)
+        return
     except Exception as exc:
         logger.exception("Job search failed: %s", exc)
         text = "Вакансия іздеу кезінде қате шықты. Кейінірек қайталап көріңіз."
@@ -509,27 +532,20 @@ async def _run_job_search(update: Update, query: str = "") -> None:
         save_log_event(direction="bot", event_type="jobs_error", content=text, update=update, metadata={"error": str(exc)})
         return
 
-    if vacancies:
-        response = _format_vacancies_message("Сізге сай 3-5 вакансия:", vacancies, True, build_quick_job_tip(profile_record))
-        await update.effective_message.reply_text(response, reply_markup=_main_menu_keyboard(), disable_web_page_preview=True)
-        save_log_event(
-            direction="bot",
-            event_type="job_results",
-            content=response,
-            update=update,
-            metadata={"results": len(vacancies), "query": profile.effective_query},
-        )
+    if not vacancies:
+        await update.effective_message.reply_text(NO_RELIABLE_VACANCY_TEXT, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="job_no_reliable_results", content=NO_RELIABLE_VACANCY_TEXT, update=update)
         return
 
-    examples = build_example_vacancies(profile)
-    response = _format_vacancies_message(
-        "Нақты live вакансия табылмады. Төменде ұқсас мысалдар:",
-        examples,
-        True,
-        build_quick_job_tip(profile_record),
-    )
+    response = _format_vacancies_message("Сізге сай сенімді вакансиялар:", vacancies, True, build_quick_job_tip(profile_record))
     await update.effective_message.reply_text(response, reply_markup=_main_menu_keyboard(), disable_web_page_preview=True)
-    save_log_event(direction="bot", event_type="job_examples", content=response, update=update, metadata={"query": profile.effective_query})
+    save_log_event(
+        direction="bot",
+        event_type="job_results",
+        content=response,
+        update=update,
+        metadata={"results": len(vacancies), "query": profile.effective_query},
+    )
 
 
 async def _build_ai_or_fallback_response(profile: Dict[str, object], prompt: str, fallback_text: str) -> str:
@@ -562,7 +578,7 @@ async def _reply_with_ai_chat(update: Update, prompt: str, event_type: str) -> N
         response = await ask_career_ai(
             prompt=(
                 "Answer the user's career question briefly and practically. "
-                "If useful, include next step suggestions.\n\n"
+                "If the user message contains fake vacancy or client details, return a short error instead.\n\n"
                 "User message:\n{0}"
             ).format(prompt),
             profile=profile,
@@ -584,10 +600,7 @@ def _format_vacancies_message(heading: str, vacancies, include_tip: bool, tip: s
         lines.append("Компания: {0}".format(vacancy.company))
         lines.append("Қысқаша: {0}".format(vacancy.summary))
         lines.append("Жалақы: {0}".format(vacancy.salary))
-        if vacancy.apply_url:
-            lines.append("Өтініш: {0} {1}".format(vacancy.apply_text, vacancy.apply_url))
-        else:
-            lines.append("Өтініш: {0}".format(vacancy.apply_text))
+        lines.append("Өтініш: {0} {1}".format(vacancy.apply_text, vacancy.apply_url))
         lines.append("Дереккөз: {0}".format(vacancy.source))
 
     if include_tip and tip:
