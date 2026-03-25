@@ -1,6 +1,7 @@
 """Telegram handlers for the job assistant bot."""
 
 import logging
+import re
 from typing import Dict, Optional
 
 import request_database
@@ -10,6 +11,7 @@ from job_search import (
     UnsafeJobDataError,
     build_profile_from_record,
     experience_label,
+    normalize_text,
     parse_salary_range,
     partition_vacancies,
     profile_summary,
@@ -25,31 +27,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 logger = logging.getLogger(__name__)
 
 PROFILE_STEPS = ("city", "field", "experience", "work_mode", "salary")
-
-EXPERIENCE_OPTIONS = {
-    "жоқ": "no_experience",
-    "жок": "no_experience",
-    "нет": "no_experience",
-    "no": "no_experience",
-    "1 жыл": "one_year",
-    "1": "one_year",
-    "бір жыл": "one_year",
-    "one year": "one_year",
-    "3+ жыл": "three_plus",
-    "3+": "three_plus",
-    "3 жыл": "three_plus",
-    "3 жылдан жоғары": "three_plus",
-}
-
-WORK_MODE_OPTIONS = {
-    "офлайн": "offline",
-    "offline": "offline",
-    "онлайн": "online",
-    "online": "online",
-    "удаленно": "online",
-    "гибрид": "hybrid",
-    "hybrid": "hybrid",
-}
+PROFILE_REQUIRED_STEPS = PROFILE_STEPS[:-1]
 
 MENU_JOB_SEARCH = "Вакансия табу"
 MENU_PROFILE = "Профиль толтыру"
@@ -62,6 +40,107 @@ MENU_HELP = "Көмек"
 
 SKIP_SALARY_VALUES = {"өткізу", "откізу", "skip", "жоқ", "керек емес"}
 
+CANCEL_FLOW_PHRASES = {
+    "болды",
+    "жап",
+    "жаба сал",
+    "таста",
+    "тоқта",
+    "токта",
+    "cancel",
+    "stop",
+    "отмена",
+    "керек емес",
+    "не надо",
+    "не нужно",
+}
+
+CITY_CANONICAL = {
+    "алматы": "Алматы",
+    "almaty": "Алматы",
+    "астана": "Астана",
+    "astana": "Астана",
+    "nursultan": "Астана",
+    "nur sultan": "Астана",
+    "шымкент": "Шымкент",
+    "shymkent": "Шымкент",
+    "караганда": "Қарағанды",
+    "қарағанды": "Қарағанды",
+    "karaganda": "Қарағанды",
+    "qaragandy": "Қарағанды",
+    "атырау": "Атырау",
+    "atyrau": "Атырау",
+    "актау": "Ақтау",
+    "aktau": "Ақтау",
+    "актобе": "Ақтөбе",
+    "ақтөбе": "Ақтөбе",
+    "aktobe": "Ақтөбе",
+    "aqtobe": "Ақтөбе",
+    "костанай": "Қостанай",
+    "қостанай": "Қостанай",
+    "kostanay": "Қостанай",
+    "qostanay": "Қостанай",
+    "павлодар": "Павлодар",
+    "pavlodar": "Павлодар",
+    "тараз": "Тараз",
+    "taraz": "Тараз",
+    "кызылорда": "Қызылорда",
+    "қызылорда": "Қызылорда",
+    "kyzylorda": "Қызылорда",
+    "qyzylorda": "Қызылорда",
+    "семей": "Семей",
+    "semey": "Семей",
+    "туркестан": "Түркістан",
+    "түркістан": "Түркістан",
+    "turkistan": "Түркістан",
+    "орал": "Орал",
+    "oral": "Орал",
+    "уральск": "Орал",
+    "uralsk": "Орал",
+}
+
+FIELD_KEYWORDS = {
+    "IT": ("it", "айти", "developer", "backend", "frontend", "python", "java", "qa", "devops", "data", "ml"),
+    "Маркетинг": ("маркетинг", "marketing", "smm", "target", "таргет", "seo", "контент", "brand"),
+    "Білім": ("білім", "education", "мұғалім", "мугалим", "оқыт", "учител", "преподав", "teacher", "tutor"),
+    "Сату": ("сату", "sales", "продаж", "sales manager", "account manager"),
+    "Дизайн": ("дизайн", "design", "designer", "ux", "ui", "graphic", "motion"),
+    "Қаржы": ("қаржы", "каржы", "finance", "финанс", "бухгалтер", "accountant", "audit", "analyst"),
+    "HR": ("hr", "recruiter", "рекрутер", "hr manager", "human resources"),
+}
+
+GENERIC_CITY_BLOCKLIST = {
+    "жумыс",
+    "жұмыс",
+    "работа",
+    "job",
+    "vacancy",
+    "вакансия",
+    "онлайн",
+    "офлайн",
+    "гибрид",
+    "remote",
+    "marketing",
+    "маркетинг",
+    "it",
+    "айти",
+    "резюме",
+    "cv",
+    "resume",
+}
+
+GENERIC_FIELD_BLOCKLIST = {
+    "жумыс",
+    "жұмыс",
+    "работа",
+    "job",
+    "vacancy",
+    "вакансия",
+    "керек",
+    "нужно",
+    "нужна",
+}
+
 UNSAFE_VACANCY_TEXT = (
     "Қате: сенімсіз немесе өтірік вакансия ақпараты анықталды. "
     "Бот ондай хабарландыруды көрсетпейді."
@@ -70,6 +149,207 @@ UNSAFE_VACANCY_TEXT = (
 NO_RELIABLE_VACANCY_TEXT = (
     "Қазір сенімді вакансия табылмады. Сұрауды нақтылап көріңіз немесе тек ресми сайттарды қолданыңыз."
 )
+
+
+def _matches_phrase(text: str, phrase: str) -> bool:
+    wrapped = " {0} ".format(text)
+    target = " {0} ".format(phrase)
+    return target in wrapped
+
+
+def _capitalize_value(value: str) -> str:
+    clean_value = " ".join(value.strip(" ,.!?").split())
+    if not clean_value:
+        return ""
+    return clean_value[0].upper() + clean_value[1:]
+
+
+def _looks_like_cancel(text: str) -> bool:
+    normalized = normalize_text(text)
+    return any(_matches_phrase(normalized, phrase) for phrase in CANCEL_FLOW_PHRASES)
+
+
+def _looks_like_salary_skip(text: str) -> bool:
+    normalized = normalize_text(text)
+    return any(_matches_phrase(normalized, phrase) for phrase in SKIP_SALARY_VALUES)
+
+
+def _extract_numeric_tokens(text: str) -> list[int]:
+    values = []
+    for chunk in re.findall(r"\d[\d\s]*", text):
+        normalized = re.sub(r"\s+", "", chunk)
+        if normalized.isdigit():
+            values.append(int(normalized))
+    return values
+
+
+def _looks_like_salary_text(text: str, current_step: str) -> bool:
+    if current_step == "salary":
+        return True
+
+    normalized = normalize_text(text)
+    if any(token in normalized for token in ("жалақы", "жалакы", "salary", "айлық", "айлык", "kzt", "тенге", "тг", "мың", "мын")):
+        return True
+
+    numbers = _extract_numeric_tokens(text)
+    return any(number >= 50000 for number in numbers)
+
+
+def _city_keyword_matches(normalized: str, keyword: str) -> bool:
+    if " " in keyword:
+        return _matches_phrase(normalized, keyword)
+    return any(word == keyword or word.startswith(keyword) for word in normalized.split())
+
+
+def _detect_city(text: str, current_step: str) -> str:
+    normalized = normalize_text(text)
+    for keyword, city in CITY_CANONICAL.items():
+        if _city_keyword_matches(normalized, keyword):
+            return city
+
+    if current_step != "city":
+        return ""
+
+    raw_value = _capitalize_value(text)
+    if not raw_value or len(raw_value.split()) > 3:
+        return ""
+    if any(token in normalized for token in GENERIC_CITY_BLOCKLIST):
+        return ""
+    if _looks_like_salary_text(text, "") or _detect_experience(text) or _detect_work_mode(text):
+        return ""
+    return raw_value
+
+
+def _detect_field(text: str, current_step: str) -> str:
+    normalized = normalize_text(text)
+    for field_name, keywords in FIELD_KEYWORDS.items():
+        if any(_matches_phrase(normalized, keyword) for keyword in keywords):
+            return field_name
+
+    if current_step != "field":
+        return ""
+
+    raw_value = _capitalize_value(text)
+    if not raw_value or len(raw_value.split()) > 5 or re.search(r"\d", raw_value):
+        return ""
+    if any(token in normalized for token in GENERIC_FIELD_BLOCKLIST):
+        return ""
+    if _detect_city(text, "") or _detect_experience(text) or _detect_work_mode(text):
+        return ""
+    return raw_value
+
+
+def _detect_experience(text: str, current_step: str = "") -> str:
+    normalized = normalize_text(text)
+    lowered = text.lower()
+    if "3+" in lowered or any(token in normalized for token in ("3 plus", "senior")):
+        return "three_plus"
+    if any(token in normalized for token in ("жок", "нет опыта", "без опыта", "no experience", "junior", "стажер", "intern")):
+        return "no_experience"
+    if any(token in normalized for token in ("1 3", "middle", "mid level")):
+        return "one_year"
+
+    year_matches = re.findall(r"(\d+)\s*(жыл|жылдан|год|года|лет|year)", normalized)
+    for number_text, _ in year_matches:
+        number = int(number_text)
+        if number >= 3:
+            return "three_plus"
+        if number in (1, 2):
+            return "one_year"
+        if number == 0:
+            return "no_experience"
+
+    if any(token in normalized for token in ("бір жыл", "бир жыл", "1 жыл", "1 год", "1 year")):
+        return "one_year"
+
+    if current_step == "experience":
+        numbers = _extract_numeric_tokens(text)
+        if len(numbers) == 1:
+            number = numbers[0]
+            if number >= 3:
+                return "three_plus"
+            if number in (1, 2):
+                return "one_year"
+            if number == 0:
+                return "no_experience"
+    return ""
+
+
+def _detect_work_mode(text: str) -> str:
+    normalized = normalize_text(text)
+    if any(token in normalized for token in ("гибрид", "hybrid", "аралас")):
+        return "hybrid"
+    if any(token in normalized for token in ("онлайн", "online", "remote", "удал", "үйден", "уйден", "дистанцион")):
+        return "online"
+    if any(token in normalized for token in ("офлайн", "offline", "офис", "кеңсе", "кенсе", "onsite", "on site")):
+        return "offline"
+    return ""
+
+
+def _extract_profile_hints(answer: str, current_step: str) -> tuple[Dict[str, object], bool]:
+    hints: Dict[str, object] = {}
+
+    city = _detect_city(answer, current_step)
+    if city:
+        hints["city"] = city
+
+    field = _detect_field(answer, current_step)
+    if field:
+        hints["field"] = field
+
+    experience = _detect_experience(answer, current_step)
+    if experience:
+        hints["experience"] = experience
+
+    work_mode = _detect_work_mode(answer)
+    if work_mode:
+        hints["work_mode"] = work_mode
+
+    salary_handled = False
+    if current_step == "salary":
+        salary_handled = True
+        if _looks_like_salary_skip(answer):
+            hints["salary_text"] = ""
+            hints["salary_from"] = None
+            hints["salary_to"] = None
+        else:
+            salary_text, salary_from, salary_to = parse_salary_range(answer)
+            hints["salary_text"] = salary_text
+            hints["salary_from"] = salary_from
+            hints["salary_to"] = salary_to
+    else:
+        large_numbers = [number for number in _extract_numeric_tokens(answer) if number >= 50000]
+        if large_numbers:
+            salary_handled = True
+            if len(large_numbers) == 1:
+                hints["salary_text"] = str(large_numbers[0])
+                hints["salary_from"] = large_numbers[0]
+                hints["salary_to"] = None
+            else:
+                salary_from, salary_to = sorted(large_numbers[:2])
+                hints["salary_text"] = "{0}-{1}".format(salary_from, salary_to)
+                hints["salary_from"] = salary_from
+                hints["salary_to"] = salary_to
+
+    return hints, salary_handled
+
+
+def _next_profile_step(profile: Dict[str, object], salary_handled: bool) -> str:
+    for step in PROFILE_REQUIRED_STEPS:
+        if not str(profile.get(step, "") or "").strip():
+            return step
+    return "" if salary_handled else "salary"
+
+
+def _fallback_profile_clarification(step: str) -> str:
+    prompts = {
+        "city": "Қай қалада жұмыс іздейтініңізді бір сөйлеммен жазыңыз. Мысалы: Алматы немесе Астана.",
+        "field": "Қай сала керек екенін еркін жаза салыңыз. Мысалы: Python backend, маркетинг, білім.",
+        "experience": "Тәжірибеңізді еркін жазыңыз. Мысалы: тәжірибем жоқ, 1 жыл, 3+ жыл.",
+        "work_mode": "Жұмыс форматын жазыңыз: онлайн, офлайн, гибрид немесе remote.",
+        "salary": "Жалақыны еркін жаза салыңыз. Мысалы: 300000-450000 немесе өткізу.",
+    }
+    return prompts.get(step, "Жауапты қысқа жаза салыңыз.")
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -94,6 +374,16 @@ def _work_mode_keyboard() -> ReplyKeyboardMarkup:
 
 def _salary_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([["Өткізу"]], resize_keyboard=True, one_time_keyboard=True)
+
+
+def _profile_step_reply_markup(step: str):
+    if step == "experience":
+        return _experience_keyboard()
+    if step == "work_mode":
+        return _work_mode_keyboard()
+    if step == "salary":
+        return _salary_keyboard()
+    return ReplyKeyboardRemove()
 
 
 def _get_user_profile(update: Update) -> Dict[str, object]:
@@ -127,12 +417,22 @@ def _is_profile_complete(profile: Dict[str, object]) -> bool:
 
 def _begin_profile_flow(context: ContextTypes.DEFAULT_TYPE, existing_profile: Optional[Dict[str, object]] = None) -> None:
     context.user_data["profile_step"] = PROFILE_STEPS[0]
-    context.user_data["pending_profile"] = dict(existing_profile or {})
+    context.user_data["pending_profile"] = {
+        "city": "",
+        "field": "",
+        "experience": "",
+        "work_mode": "",
+        "salary_text": "",
+        "salary_from": None,
+        "salary_to": None,
+    }
+    context.user_data["salary_handled"] = False
 
 
 def _cancel_profile_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("profile_step", None)
     context.user_data.pop("pending_profile", None)
+    context.user_data.pop("salary_handled", None)
 
 
 async def _ask_current_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -141,25 +441,62 @@ async def _ask_current_question(update: Update, context: ContextTypes.DEFAULT_TY
 
     step = context.user_data.get("profile_step", "")
     if step == "city":
-        await update.effective_message.reply_text("Қай қалада жұмыс іздейсіз?", reply_markup=ReplyKeyboardRemove())
+        await update.effective_message.reply_text(
+            "Қай қалада жұмыс іздейсіз? Еркін жаза беріңіз. Мысалы: Алматы немесе Астанада онлайн IT.",
+            reply_markup=_profile_step_reply_markup("city"),
+        )
         return
     if step == "field":
         await update.effective_message.reply_text(
-            "Қай салада жұмыс іздейсіз? Мысалы: IT, маркетинг, білім.",
-            reply_markup=ReplyKeyboardRemove(),
+            "Қай салада жұмыс іздейсіз? Дайын тізім емес, өз сөзіңізбен жаза беріңіз. Мысалы: Python backend, маркетинг, білім.",
+            reply_markup=_profile_step_reply_markup("field"),
         )
         return
     if step == "experience":
-        await update.effective_message.reply_text("Тәжірибеңіз қандай?", reply_markup=_experience_keyboard())
+        await update.effective_message.reply_text(
+            "Тәжірибеңіз қандай? Мысалы: тәжірибем жоқ, 1 жыл, 3+ жыл, junior.",
+            reply_markup=_profile_step_reply_markup("experience"),
+        )
         return
     if step == "work_mode":
-        await update.effective_message.reply_text("Қандай формат керек?", reply_markup=_work_mode_keyboard())
+        await update.effective_message.reply_text(
+            "Қандай формат керек? Мысалы: онлайн, офлайн, гибрид, remote.",
+            reply_markup=_profile_step_reply_markup("work_mode"),
+        )
         return
     if step == "salary":
         await update.effective_message.reply_text(
-            "Қалаған жалақы диапазонын жазыңыз. Мысалы: 250000-400000. Қаламасаңыз, `Өткізу` деп жазыңыз.",
-            reply_markup=_salary_keyboard(),
+            "Қалаған жалақыны еркін жазыңыз. Мысалы: 250000-400000 немесе 350000+. Қаламасаңыз, `Өткізу` деп жазыңыз.",
+            reply_markup=_profile_step_reply_markup("salary"),
         )
+
+
+async def _profile_clarification(
+    update: Update,
+    step: str,
+    answer: str,
+    pending_profile: Dict[str, object],
+) -> None:
+    if not update.effective_message:
+        return
+
+    text = _fallback_profile_clarification(step)
+    if any_ai_available():
+        try:
+            text = await ask_career_ai(
+                prompt=(
+                    "The user is filling a short job-search profile in Telegram. "
+                    "One field is still missing. Ask only one short follow-up question in Kazakh. "
+                    "Do not give a rigid template list. Say they can answer freely in one sentence.\n\n"
+                    "Missing field: {0}\n"
+                    "User answer: {1}"
+                ).format(step, answer),
+                profile=pending_profile,
+            )
+        except Exception as exc:
+            logger.warning("Profile clarification AI failed, using fallback: %s", exc)
+
+    await update.effective_message.reply_text(text, reply_markup=_profile_step_reply_markup(step))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -187,7 +524,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     _begin_profile_flow(context, existing_profile)
-    welcome_text = "Мен сізге өзіңізге сай жұмысты тез табуға көмектесемін.\nАлдымен 5 қысқа сұрақ қоямын."
+    welcome_text = (
+        "Мен сізге өзіңізге сай жұмысты тез табуға көмектесемін.\n"
+        "Алдымен 5 қысқа сұрақ қоямын. Қаласаңыз, бәрін бір сөйлеммен де жаза аласыз."
+    )
     await update.message.reply_text(welcome_text, reply_markup=ReplyKeyboardRemove())
     save_log_event(direction="bot", event_type="welcome_new_profile", content=welcome_text, update=update)
     await _ask_current_question(update, context)
@@ -235,7 +575,9 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     save_log_event(direction="user", event_type="command_profile", content="/profile", update=update)
     _begin_profile_flow(context, _get_user_profile(update))
-    await update.message.reply_text("Профильді жаңартамыз. Жауаптарыңыз қысқа болса жеткілікті.")
+    await update.message.reply_text(
+        "Профильді жаңартамыз. Жауапты еркін жаза беріңіз, бот маңызды мәліметті өзі бөліп алады."
+    )
     await _ask_current_question(update, context)
 
 
@@ -442,45 +784,44 @@ async def _handle_profile_answer(update: Update, context: ContextTypes.DEFAULT_T
 
     pending_profile = dict(context.user_data.get("pending_profile", {}))
     step = str(context.user_data.get("profile_step", "") or "")
+    salary_handled = bool(context.user_data.get("salary_handled", False))
 
-    if step == "city":
-        pending_profile["city"] = answer
-        next_step = "field"
-    elif step == "field":
-        pending_profile["field"] = answer
-        next_step = "experience"
-    elif step == "experience":
-        normalized = EXPERIENCE_OPTIONS.get(answer.strip().lower())
-        if not normalized:
-            await update.message.reply_text("Таңдаңыз: Жоқ, 1 жыл, 3+ жыл.", reply_markup=_experience_keyboard())
-            return
-        pending_profile["experience"] = normalized
-        next_step = "work_mode"
-    elif step == "work_mode":
-        normalized = WORK_MODE_OPTIONS.get(answer.strip().lower())
-        if not normalized:
-            await update.message.reply_text("Таңдаңыз: Офлайн, Онлайн, Гибрид.", reply_markup=_work_mode_keyboard())
-            return
-        pending_profile["work_mode"] = normalized
-        next_step = "salary"
-    elif step == "salary":
-        normalized_answer = answer.strip().lower()
-        if normalized_answer in SKIP_SALARY_VALUES:
-            salary_text, salary_from, salary_to = "", None, None
-        else:
-            salary_text, salary_from, salary_to = parse_salary_range(answer)
-        pending_profile["salary_text"] = salary_text
-        pending_profile["salary_from"] = salary_from
-        pending_profile["salary_to"] = salary_to
-        next_step = ""
-    else:
+    if not step:
         _cancel_profile_flow(context)
         return
 
+    if _looks_like_cancel(answer) and not (step == "salary" and _looks_like_salary_skip(answer)):
+        _cancel_profile_flow(context)
+        text = "Анкетаны тоқтаттым. Енді еркін сұрақ жаза аласыз немесе /profile деп қайта бастай аласыз."
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="profile_cancelled_by_text", content=text, update=update)
+        return
+
+    hints, salary_answer_handled = _extract_profile_hints(answer, step)
+    pending_profile.update(hints)
+    salary_handled = salary_handled or salary_answer_handled
+
+    current_value = str(pending_profile.get(step, "") or "").strip()
+    if step == "salary" and salary_answer_handled:
+        current_value = "handled"
+
+    if not current_value:
+        context.user_data["pending_profile"] = pending_profile
+        context.user_data["salary_handled"] = salary_handled
+        await _profile_clarification(update, step, answer, pending_profile)
+        return
+
+    next_step = _next_profile_step(pending_profile, salary_handled)
     context.user_data["pending_profile"] = pending_profile
+    context.user_data["salary_handled"] = salary_handled
     context.user_data["profile_step"] = next_step
+
     if next_step:
         await _ask_current_question(update, context)
+        return
+
+    if not _is_profile_complete(pending_profile):
+        _cancel_profile_flow(context)
         return
 
     _save_user_profile(update, pending_profile)
