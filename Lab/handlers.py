@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Optional
 
 import request_database
+from ai_service import ask_career_ai, any_ai_available
 from career_advice import build_interview_help, build_quick_job_tip, build_resume_help, build_skills_help
 from job_search import (
     build_example_vacancies,
@@ -54,8 +55,9 @@ MENU_PROFILE = "Профиль толтыру"
 MENU_RESUME = "Резюме"
 MENU_INTERVIEW = "Сұхбат"
 MENU_SKILLS = "Дағдылар"
-MENU_HELP = "Көмек"
 MENU_WEB = "Web іздеу"
+MENU_AI = "AI кеңес"
+MENU_HELP = "Көмек"
 
 SKIP_SALARY_VALUES = {"өткізу", "откізу", "skip", "жоқ", "керек емес"}
 
@@ -66,7 +68,7 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
             [MENU_JOB_SEARCH, MENU_PROFILE],
             [MENU_RESUME, MENU_INTERVIEW],
             [MENU_SKILLS, MENU_WEB],
-            [MENU_HELP],
+            [MENU_AI, MENU_HELP],
         ],
         resize_keyboard=True,
     )
@@ -167,6 +169,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/resume - резюме көмегі\n"
             "/interview - сұхбат сұрақтары\n"
             "/skills - дамыту керек дағдылар\n"
+            "/ai - AI career кеңес\n"
             "/profile - профильді жаңарту"
         ).format(profile_summary(profile))
         await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
@@ -193,10 +196,27 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/resume - резюме көмегі\n"
         "/interview - сұхбат сұрақтары\n"
         "/skills - дамыту керек дағдылар\n"
+        "/ai <сұрақ> - AI-ден career кеңес\n"
         "/cancel - анкетаны тоқтату"
     )
     await update.message.reply_text(help_text, reply_markup=_main_menu_keyboard())
     save_log_event(direction="bot", event_type="help_message", content=help_text, update=update)
+
+
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    prompt = " ".join(context.args).strip()
+    save_log_event(direction="user", event_type="command_ai", content=prompt or "/ai", update=update)
+
+    if not prompt:
+        text = "Мысалы: /ai менің резюмемді junior backend позициясына қалай жақсартамын?"
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="ai_help", content=text, update=update)
+        return
+
+    await _reply_with_ai_chat(update, prompt, event_type="ai_chat")
 
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -281,7 +301,14 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         save_log_event(direction="bot", event_type="resume_missing_profile", content=text, update=update)
         return
 
-    response = build_resume_help(profile)
+    response = await _build_ai_or_fallback_response(
+        profile=profile,
+        prompt=(
+            "User asks for resume help. Give a short improved resume structure, "
+            "what to emphasize for the user's profile, and 3 quick fixes."
+        ),
+        fallback_text=build_resume_help(profile),
+    )
     await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
     save_log_event(direction="bot", event_type="resume_help", content=response, update=update)
 
@@ -298,7 +325,14 @@ async def interview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         save_log_event(direction="bot", event_type="interview_missing_profile", content=text, update=update)
         return
 
-    response = build_interview_help(profile)
+    response = await _build_ai_or_fallback_response(
+        profile=profile,
+        prompt=(
+            "User asks for interview preparation. Give 5 likely questions for this profile "
+            "and a short answer strategy."
+        ),
+        fallback_text=build_interview_help(profile),
+    )
     await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
     save_log_event(direction="bot", event_type="interview_help", content=response, update=update)
 
@@ -315,7 +349,14 @@ async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         save_log_event(direction="bot", event_type="skills_missing_profile", content=text, update=update)
         return
 
-    response = build_skills_help(profile)
+    response = await _build_ai_or_fallback_response(
+        profile=profile,
+        prompt=(
+            "User asks what skills to develop. Give 5 skills ordered by priority, "
+            "plus one short learning plan for the next 30 days."
+        ),
+        fallback_text=build_skills_help(profile),
+    )
     await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
     save_log_event(direction="bot", event_type="skills_help", content=response, update=update)
 
@@ -349,11 +390,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if text == MENU_SKILLS:
         await skills_command(update, context)
         return
-    if text == MENU_HELP:
-        await help_command(update, context)
-        return
     if text == MENU_WEB:
         await search_command(update, context)
+        return
+    if text == MENU_AI:
+        await _reply_with_ai_chat(update, "Маған мансап бойынша жеке кеңес бер", event_type="ai_chat_menu")
+        return
+    if text == MENU_HELP:
+        await help_command(update, context)
         return
 
     lowered = text.lower()
@@ -370,12 +414,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _run_job_search(update, query=text)
         return
 
-    response = (
-        "Мен мына нәрселерге көмектесемін: вакансия, резюме, сұхбат, дағды.\n"
-        "Жылдам бастау үшін /profile немесе /jobs қолданыңыз."
-    )
-    await update.message.reply_text(response, reply_markup=_main_menu_keyboard())
-    save_log_event(direction="bot", event_type="fallback_help", content=response, update=update)
+    await _reply_with_ai_chat(update, text, event_type="ai_chat")
 
 
 async def _handle_profile_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, answer: str) -> None:
@@ -493,6 +532,50 @@ async def _run_job_search(update: Update, query: str = "") -> None:
     save_log_event(direction="bot", event_type="job_examples", content=response, update=update, metadata={"query": profile.effective_query})
 
 
+async def _build_ai_or_fallback_response(profile: Dict[str, object], prompt: str, fallback_text: str) -> str:
+    if not any_ai_available():
+        return fallback_text
+
+    try:
+        return await ask_career_ai(prompt=prompt, profile=profile)
+    except Exception as exc:
+        logger.warning("AI response failed, using fallback: %s", exc)
+        return fallback_text
+
+
+async def _reply_with_ai_chat(update: Update, prompt: str, event_type: str) -> None:
+    if not update.message:
+        return
+
+    profile = _get_user_profile(update)
+    fallback_text = (
+        "Мен мына нәрселерге көмектесемін: вакансия, резюме, сұхбат, дағды.\n"
+        "Жылдам бастау үшін /profile немесе /jobs қолданыңыз."
+    )
+
+    if not any_ai_available():
+        await update.message.reply_text(fallback_text, reply_markup=_main_menu_keyboard())
+        save_log_event(direction="bot", event_type="fallback_help", content=fallback_text, update=update)
+        return
+
+    try:
+        response = await ask_career_ai(
+            prompt=(
+                "Answer the user's career question briefly and practically. "
+                "If useful, include next step suggestions.\n\n"
+                "User message:\n{0}"
+            ).format(prompt),
+            profile=profile,
+        )
+    except Exception as exc:
+        logger.warning("AI chat failed, using fallback: %s", exc)
+        response = fallback_text
+        event_type = "fallback_help"
+
+    await update.message.reply_text(response, reply_markup=_main_menu_keyboard(), disable_web_page_preview=True)
+    save_log_event(direction="bot", event_type=event_type, content=response, update=update)
+
+
 def _format_vacancies_message(heading: str, vacancies, include_tip: bool, tip: str = "") -> str:
     lines = [heading]
     for index, vacancy in enumerate(vacancies, start=1):
@@ -506,9 +589,11 @@ def _format_vacancies_message(heading: str, vacancies, include_tip: bool, tip: s
         else:
             lines.append("Өтініш: {0}".format(vacancy.apply_text))
         lines.append("Дереккөз: {0}".format(vacancy.source))
+
     if include_tip and tip:
         lines.append("")
         lines.append(tip)
+
     return "\n".join(lines)
 
 
@@ -524,6 +609,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("search", search_command))
